@@ -23,12 +23,18 @@ const SO_RCVTIMEO: i32 = 0x1006;
 pub struct SavedCard {
     pub hash: String,
     pub name: String,
+    /// Last digits shown by Wallet for this pass, when readable from the device.
+    #[serde(default)]
+    pub last4: Option<String>,
+    /// Payment network label (e.g. "Visa"), when readable from the device.
+    #[serde(default)]
+    pub network: Option<String>,
 }
 
 pub fn get_cards_storage_path() -> PathBuf {
     let local_app_data = std::env::var("LOCALAPPDATA")
         .unwrap_or_else(|_| r"C:\Users\Default\AppData\Local".to_string());
-    let dir = PathBuf::from(local_app_data).join("AirCard");
+    let dir = PathBuf::from(local_app_data).join(crate::paths::APP_DIR);
     let _ = fs::create_dir_all(&dir);
     dir.join("cards.json")
 }
@@ -171,9 +177,24 @@ pub fn add_or_update_card(hash: &str, name: &str) {
             } else {
                 name.to_string()
             },
+            last4: None,
+            network: None,
         });
     }
     save_saved_cards(&cards);
+}
+
+pub fn update_card_details(hash: &str, last4: Option<&str>, network: Option<&str>) {
+    let mut cards = load_saved_cards();
+    if let Some(card) = cards.iter_mut().find(|c| c.hash == hash) {
+        if let Some(value) = last4 {
+            card.last4 = Some(value.to_string());
+        }
+        if let Some(value) = network {
+            card.network = Some(value.to_string());
+        }
+        save_saved_cards(&cards);
+    }
 }
 
 const WALLET_KEYWORDS: &[&str] = &[

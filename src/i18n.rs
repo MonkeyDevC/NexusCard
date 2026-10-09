@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 pub enum Language {
     English,
     SimplifiedChinese,
+    Spanish,
 }
 
 impl Default for Language {
@@ -21,6 +22,15 @@ impl Language {
         if let Ok(contents) = fs::read_to_string(&path) {
             if let Ok(settings) = serde_json::from_str::<Settings>(&contents) {
                 return settings.language;
+            }
+        }
+
+        if let Some(locale) = windows_locale() {
+            if locale.starts_with("es") {
+                return Self::Spanish;
+            }
+            if locale.starts_with("zh") {
+                return Self::SimplifiedChinese;
             }
         }
 
@@ -50,8 +60,10 @@ impl Language {
     }
 
     pub fn text<'a>(self, source: &'a str) -> &'a str {
-        if self == Self::English {
-            return source;
+        match self {
+            Self::English => return source,
+            Self::Spanish => return crate::i18n_es::translate(source),
+            Self::SimplifiedChinese => {}
         }
 
         match source {
@@ -205,10 +217,28 @@ impl Language {
         match (self, option) {
             (Self::English, Self::English) => "English",
             (Self::English, Self::SimplifiedChinese) => "Simplified Chinese",
+            (Self::English, Self::Spanish) => "Spanish (Mexico)",
             (Self::SimplifiedChinese, Self::English) => "英语",
             (Self::SimplifiedChinese, Self::SimplifiedChinese) => "简体中文",
+            (Self::SimplifiedChinese, Self::Spanish) => "西班牙语（墨西哥）",
+            (Self::Spanish, Self::English) => "Inglés",
+            (Self::Spanish, Self::SimplifiedChinese) => "Chino simplificado",
+            (Self::Spanish, Self::Spanish) => "Español (México)",
         }
     }
+}
+
+/// Windows user locale name such as "es-MX", lowercased.
+fn windows_locale() -> Option<String> {
+    unsafe extern "system" {
+        fn GetUserDefaultLocaleName(name: *mut u16, len: i32) -> i32;
+    }
+    let mut buf = [0u16; 85];
+    let n = unsafe { GetUserDefaultLocaleName(buf.as_mut_ptr(), buf.len() as i32) };
+    if n <= 1 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buf[..(n - 1) as usize]).to_ascii_lowercase())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -220,7 +250,7 @@ fn settings_path() -> PathBuf {
     let local_app_data = std::env::var("LOCALAPPDATA")
         .unwrap_or_else(|_| r"C:\Users\Default\AppData\Local".to_string());
     PathBuf::from(local_app_data)
-        .join("AirCard")
+        .join(crate::paths::APP_DIR)
         .join("settings.json")
 }
 
@@ -246,6 +276,16 @@ mod tests {
         assert_eq!(
             Language::SimplifiedChinese.option_label(Language::SimplifiedChinese),
             "简体中文"
+        );
+    }
+
+    #[test]
+    fn spanish_translates_and_falls_back() {
+        assert_eq!(Language::Spanish.text("Help"), "Ayuda");
+        assert_eq!(Language::Spanish.text("unknown string"), "unknown string");
+        assert_eq!(
+            Language::Spanish.option_label(Language::Spanish),
+            "Español (México)"
         );
     }
 }
