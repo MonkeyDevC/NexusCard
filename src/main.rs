@@ -5,26 +5,32 @@ mod airlift;
 mod airtraffic;
 mod app;
 mod apple;
+mod card_info;
 mod device;
 mod flasher;
 mod image_skin;
 mod i18n;
+mod i18n_es;
+mod license;
+mod paths;
 mod passthm;
 mod scanner;
+mod ui_kit;
 mod wallet_backup;
 
 fn main() -> eframe::Result<()> {
+    paths::migrate_legacy_data();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 640.0])
-            .with_min_inner_size([880.0, 560.0])
-            .with_title("AirCard v1.2.4"),
+            .with_inner_size([1080.0, 720.0])
+            .with_min_inner_size([940.0, 640.0])
+            .with_title(concat!("NexusCard v", env!("CARGO_PKG_VERSION"))),
         ..Default::default()
     };
 
     eframe::run_native(
-        "AirCard v1.2.4",
+        concat!("NexusCard v", env!("CARGO_PKG_VERSION")),
         options,
-        Box::new(|cc| Ok(Box::new(app::AirCardApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(app::NexusCardApp::new(cc)))),
     )
 }

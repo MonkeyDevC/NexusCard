@@ -33,8 +33,8 @@ jobs:
         shell: pwsh
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer\aircard.iss "/DAppVersion=$version" "/DExePath=..\target\release\aircard.exe"
-          Copy-Item target\release\aircard.exe installer\Output\aircard.exe
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer\nexuscard.iss "/DAppVersion=$version" "/DExePath=..\target\release\nexuscard.exe"
+          Copy-Item target\release\nexuscard.exe installer\Output\nexuscard.exe
           Get-ChildItem installer\Output\*.exe | ForEach-Object {
             $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
             "$h  $($_.Name)" | Out-File -Append -Encoding ascii installer\Output\SHA256SUMS.txt
@@ -43,7 +43,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: aircard-windows
+          name: nexuscard-windows
           path: installer/Output/*
           if-no-files-found: error
 
@@ -52,7 +52,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            installer/Output/AirCard-Setup-*.exe
-            installer/Output/aircard.exe
+            installer/Output/NexusCard-Setup-*.exe
+            installer/Output/nexuscard.exe
             installer/Output/SHA256SUMS.txt
           generate_release_notes: true

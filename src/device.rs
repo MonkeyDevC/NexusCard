@@ -124,8 +124,8 @@ pub fn query_usbmux_devices() -> Result<Vec<UsbmuxDeviceEntry>> {
 
     let mut req_dict = HashMap::new();
     req_dict.insert("MessageType".to_string(), plist::Value::String("ListDevices".to_string()));
-    req_dict.insert("ClientVersionString".to_string(), plist::Value::String("aircard".to_string()));
-    req_dict.insert("ProgName".to_string(), plist::Value::String("aircard".to_string()));
+    req_dict.insert("ClientVersionString".to_string(), plist::Value::String("nexuscard".to_string()));
+    req_dict.insert("ProgName".to_string(), plist::Value::String("nexuscard".to_string()));
 
     let mut plist_bytes = Vec::new();
     plist::to_writer_xml(&mut plist_bytes, &plist::Value::Dictionary(req_dict.into_iter().collect()))

@@ -19,9 +19,10 @@ impl PreparedSkin {
         image: DynamicImage,
         focus_x: f32,
         focus_y: f32,
+        zoom: f32,
     ) -> Result<Self> {
         let (source_width, source_height) = image.dimensions();
-        let cropped = crop_for_card(image, focus_x, focus_y);
+        let cropped = crop_for_card(image, focus_x, focus_y, zoom);
         let final_image = cropped.resize_exact(CARD_WIDTH, CARD_HEIGHT, FilterType::Lanczos3);
         let rgba = final_image.to_rgba8();
 
@@ -46,12 +47,14 @@ pub fn crop_uv_for_card(
     source_height: u32,
     focus_x: f32,
     focus_y: f32,
+    zoom: f32,
 ) -> [f32; 4] {
     let (x, y, width, height) = crop_bounds_for_card(
         source_width,
         source_height,
         focus_x,
         focus_y,
+        zoom,
     );
 
     [
@@ -131,33 +134,41 @@ pub fn png_to_pdf(png_bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(pdf)
 }
 
-fn crop_for_card(image: DynamicImage, focus_x: f32, focus_y: f32) -> DynamicImage {
+fn crop_for_card(image: DynamicImage, focus_x: f32, focus_y: f32, zoom: f32) -> DynamicImage {
     let (width, height) = image.dimensions();
     let (x, y, crop_width, crop_height) =
-        crop_bounds_for_card(width, height, focus_x, focus_y);
+        crop_bounds_for_card(width, height, focus_x, focus_y, zoom);
     image.crop_imm(x, y, crop_width, crop_height)
 }
 
+pub const MIN_ZOOM: f32 = 1.0;
+pub const MAX_ZOOM: f32 = 4.0;
+
+/// Crop window (x, y, width, height) in source pixels. At zoom 1.0 the window is the largest
+/// card-shaped area that fits the image; higher zoom shrinks it, and the focus point
+/// (0..1 on each axis) slides it across whatever room is left.
 fn crop_bounds_for_card(
     width: u32,
     height: u32,
     focus_x: f32,
     focus_y: f32,
+    zoom: f32,
 ) -> (u32, u32, u32, u32) {
     let card_ratio = CARD_WIDTH as f64 / CARD_HEIGHT as f64;
     let source_ratio = width as f64 / height as f64;
 
-    if source_ratio > card_ratio {
-        let crop_width = ((height as f64 * card_ratio).round() as u32).clamp(1, width);
-        let max_x = width.saturating_sub(crop_width);
-        let x = (focus_x.clamp(0.0, 1.0) * max_x as f32).round() as u32;
-        (x, 0, crop_width, height)
+    let (base_width, base_height) = if source_ratio > card_ratio {
+        (((height as f64 * card_ratio).round() as u32).clamp(1, width), height)
     } else {
-        let crop_height = ((width as f64 / card_ratio).round() as u32).clamp(1, height);
-        let max_y = height.saturating_sub(crop_height);
-        let y = (focus_y.clamp(0.0, 1.0) * max_y as f32).round() as u32;
-        (0, y, width, crop_height)
-    }
+        (width, ((width as f64 / card_ratio).round() as u32).clamp(1, height))
+    };
+
+    let zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM) as f64;
+    let crop_width = ((base_width as f64 / zoom).round() as u32).clamp(1, width);
+    let crop_height = ((base_height as f64 / zoom).round() as u32).clamp(1, height);
+    let x = (focus_x.clamp(0.0, 1.0) * width.saturating_sub(crop_width) as f32).round() as u32;
+    let y = (focus_y.clamp(0.0, 1.0) * height.saturating_sub(crop_height) as f32).round() as u32;
+    (x, y, crop_width, crop_height)
 }
 
 #[cfg(test)]
@@ -181,11 +192,34 @@ mod tests {
 
     #[test]
     fn crop_focus_moves_toward_image_edges() {
-        let left = crop_uv_for_card(2400, 1000, 0.0, 0.5);
-        let right = crop_uv_for_card(2400, 1000, 1.0, 0.5);
+        let left = crop_uv_for_card(2400, 1000, 0.0, 0.5, 1.0);
+        let right = crop_uv_for_card(2400, 1000, 1.0, 0.5, 1.0);
         assert!(left[0] < right[0]);
         assert!(left[2] < right[2]);
         assert_eq!(left[1], 0.0);
         assert_eq!(right[3], 1.0);
+    }
+
+    #[test]
+    fn zoom_shrinks_the_crop_window_and_keeps_card_ratio() {
+        let fit = crop_uv_for_card(2400, 1000, 0.5, 0.5, 1.0);
+        let zoomed = crop_uv_for_card(2400, 1000, 0.5, 0.5, 2.0);
+        let fit_width = fit[2] - fit[0];
+        let zoomed_width = zoomed[2] - zoomed[0];
+        assert!((zoomed_width - fit_width / 2.0).abs() < 0.01);
+
+        let (_, _, w, h) = crop_bounds_for_card(2400, 1000, 0.5, 0.5, 2.0);
+        let ratio = w as f64 / h as f64;
+        assert!((ratio - CARD_WIDTH as f64 / CARD_HEIGHT as f64).abs() < 0.01);
+    }
+
+    #[test]
+    fn zoom_is_clamped_and_focus_reaches_both_axes() {
+        let (_, _, w1, _) = crop_bounds_for_card(2400, 1000, 0.5, 0.5, 100.0);
+        let (_, _, w2, _) = crop_bounds_for_card(2400, 1000, 0.5, 0.5, MAX_ZOOM);
+        assert_eq!(w1, w2);
+        let top = crop_uv_for_card(2400, 1000, 0.5, 0.0, 2.0);
+        let bottom = crop_uv_for_card(2400, 1000, 0.5, 1.0, 2.0);
+        assert!(top[1] < bottom[1]);
     }
 }

@@ -16,7 +16,7 @@ fn backup_root() -> PathBuf {
     let local_app_data = std::env::var("LOCALAPPDATA")
         .unwrap_or_else(|_| r"C:\Users\Default\AppData\Local".to_string());
     PathBuf::from(local_app_data)
-        .join("AirCard")
+        .join(crate::paths::APP_DIR)
         .join("wallet-backups")
 }
 
@@ -73,7 +73,7 @@ fn card_hash_candidates(card_hash: &str) -> Vec<String> {
     candidates
 }
 
-fn find_device_card_hash(afc: &AfcClient, card_hash: &str) -> Result<Option<String>> {
+pub fn find_device_card_hash(afc: &AfcClient, card_hash: &str) -> Result<Option<String>> {
     for candidate in card_hash_candidates(card_hash) {
         let pkpass_dir = format!("/var/mobile/Library/Passes/Cards/{candidate}.pkpass");
         if afc.exists(&pkpass_dir) {

@@ -22,3 +22,10 @@ Desktop.ini
 # Logs and temp files
 *.log
 *.tmp
+
+target-ui/
+target-ui2/
+target-ui3/
+target-ui4/
+target-ui5/
+target-ui6/
