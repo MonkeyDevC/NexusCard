@@ -18,7 +18,7 @@ const DEFAULT_API: &str = "https://scalvache.shop/productos/NexusCard/api/v1";
 /// Ed25519 public key of the production license server (base64, 32 bytes).
 /// It matches `GET /api/v1/public-key`. A different key can be supplied through the
 /// NEXUSCARD_PUBLIC_KEY environment variable to test against a local server.
-const SERVER_PUBLIC_KEY_B64: &str = "wAOvpoHIb32j+TRV5N27PmaOHuoW2OVCWokwVybuZro=";
+const SERVER_PUBLIC_KEY_B64: &str = "+5lELhy4TKAKv57rqa+m6wuv0gJmV68qarFhSzLuNsI=";
 
 pub fn api_base() -> String {
     std::env::var("NEXUSCARD_API").unwrap_or_else(|_| DEFAULT_API.to_string())
