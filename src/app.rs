@@ -10,12 +10,14 @@ use image::DynamicImage;
 
 use crate::apple;
 use crate::card_info::{CardInfo, fetch_card_info, load_thumb, save_thumb};
-use crate::device::{ConnectionMode, DeviceInfo, DeviceTransport, list_connected_devices};
-use crate::flasher::{flash_passcode_theme, flash_wallet_skin, restore_wallet_original};
+use crate::device::{
+    ConnectionMode, DeviceInfo, DeviceTransport, launch_apple_devices, list_connected_devices,
+    usbmuxd_available,
+};
+use crate::flasher::{flash_wallet_skin, restore_wallet_original};
 use crate::image_skin::{MAX_ZOOM, MIN_ZOOM, PreparedSkin, crop_uv_for_card};
 use crate::i18n::Language;
 use crate::license;
-use crate::passthm::{PasscodeTheme, parse_passthm_file};
 use crate::scanner::{SavedCard, is_valid_card_hash, load_saved_cards, scan_syslog_for_cards, update_card_details};
 use crate::ui_kit;
 use crate::wallet_backup::backup_exists;
@@ -23,7 +25,6 @@ use crate::wallet_backup::backup_exists;
 #[derive(PartialEq, Eq)]
 enum AppTab {
     Wallet,
-    Passcode,
     Help,
 }
 
@@ -106,6 +107,7 @@ pub struct NexusCardApp {
     info_requested: Option<(String, String)>,
 
     // License
+    brand_logo: Option<egui::TextureHandle>,
     machine_id: Option<String>,
     license: Option<license::Status>,
     show_license: bool,
@@ -115,13 +117,10 @@ pub struct NexusCardApp {
     last_license_poll: std::time::Instant,
     net_rx: Option<Receiver<NetMessage>>,
 
-    // Passcode tab
-    theme_path: Option<PathBuf>,
-    loaded_theme: Option<PasscodeTheme>,
-    forced_telephony_ver: String,
-    keypad_language: String,
-    passcode_bold: bool,
-    keypad_textures: Vec<(String, egui::TextureHandle)>,
+    // Apple Devices auto-start: when usbmuxd is down we open the app once and wait for it.
+    usbmux_wait: Option<std::time::Instant>,
+    apple_launch_tried: bool,
+    last_usbmux_check: std::time::Instant,
 
     // Worker thread & progress
     is_busy: bool,
@@ -174,6 +173,7 @@ impl NexusCardApp {
             info_rx: None,
             info_requested: None,
 
+            brand_logo: load_brand_logo(&cc.egui_ctx),
             machine_id: license::machine_id().ok(),
             license: None,
             show_license: false,
@@ -183,12 +183,9 @@ impl NexusCardApp {
             last_license_poll: std::time::Instant::now(),
             net_rx: None,
 
-            theme_path: None,
-            loaded_theme: None,
-            forced_telephony_ver: "Auto (TelephonyUI-10)".to_string(),
-            keypad_language: "English".to_string(),
-            passcode_bold: false,
-            keypad_textures: Vec::new(),
+            usbmux_wait: None,
+            apple_launch_tried: false,
+            last_usbmux_check: std::time::Instant::now(),
 
             is_busy: false,
             progress_step: 0,
@@ -229,13 +226,20 @@ impl NexusCardApp {
 
     fn add_log(&mut self, text: impl AsRef<str>) {
         let ts = current_timestamp();
-        self.logs.push(format!("[{}] {}", ts, text.as_ref()));
+        let line = format!("[{}] {}", ts, text.as_ref());
+        append_log_file(&line);
+        self.logs.push(line);
         if self.logs.len() > 1000 {
             self.logs.remove(0);
         }
     }
 
     fn refresh_devices(&mut self) {
+        if !usbmuxd_available() {
+            self.handle_usbmuxd_down();
+            return;
+        }
+        self.usbmux_wait = None;
         self.add_log("Scanning for connected iOS devices via usbmuxd...");
         match list_connected_devices() {
             Ok(devs) => {
@@ -254,6 +258,15 @@ impl NexusCardApp {
                     self.status_msg = self
                         .language
                         .text("No iPhone connected via USB or paired WiFi.")
+                        .to_string();
+                } else if self.connection_mode == ConnectionMode::Wifi
+                    && !self.devices.iter().any(|device| device.has_transport(DeviceTransport::Wifi))
+                {
+                    // usbmuxd only lists a "Network" entry once WiFi sync is enabled for the paired iPhone.
+                    self.add_log("iPhone is visible over USB only; usbmuxd reports no WiFi (Network) entry. Enable 'Show this iPhone when on Wi-Fi' in Apple Devices/iTunes.");
+                    self.status_msg = self
+                        .language
+                        .text("The iPhone is only visible over USB. To use WiFi, enable \"Show this iPhone when on Wi-Fi\" in Apple Devices, then unplug the cable and refresh.")
                         .to_string();
                 } else {
                     let dev_logs: Vec<String> = self.devices.iter().enumerate().map(|(i, d)| {
@@ -279,6 +292,56 @@ impl NexusCardApp {
                     err
                 );
             }
+        }
+    }
+
+    /// usbmuxd is not answering. With the Store app it only runs while Apple Devices is
+    /// open, so open it once and let `poll_usbmuxd` refresh as soon as the port answers.
+    fn handle_usbmuxd_down(&mut self) {
+        const WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(25);
+        self.devices.clear();
+        self.selected_udid = None;
+
+        if self.usbmux_wait.is_none() && !self.apple_launch_tried && apple::apple_devices_installed() {
+            self.apple_launch_tried = true;
+            if launch_apple_devices() {
+                self.add_log("usbmuxd is not running; opening Apple Devices to start it.");
+                self.usbmux_wait = Some(std::time::Instant::now());
+            }
+        }
+        if self.usbmux_wait.is_some_and(|started| started.elapsed() < WAIT_LIMIT) {
+            self.status_msg = self
+                .language
+                .text("Opening Apple Devices so NexusCard can see your iPhone...")
+                .to_string();
+            return;
+        }
+
+        self.usbmux_wait = None;
+        self.add_log("usbmuxd (127.0.0.1:27015) is not answering.");
+        self.status_msg = self
+            .language
+            .text(if apple::apple_devices_installed() {
+                "Apple Devices is not responding. Open it, keep it open and press Refresh."
+            } else {
+                "Install Apple Devices from the Microsoft Store (or iTunes) and press Refresh."
+            })
+            .to_string();
+    }
+
+    /// While waiting for Apple Devices to start, check the port once a second.
+    fn poll_usbmuxd(&mut self, ctx: &egui::Context) {
+        let Some(started) = self.usbmux_wait else { return };
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        if self.last_usbmux_check.elapsed() < std::time::Duration::from_secs(1) {
+            return;
+        }
+        self.last_usbmux_check = std::time::Instant::now();
+        if usbmuxd_available() {
+            self.add_log(format!("usbmuxd answered after {:.1}s.", started.elapsed().as_secs_f32()));
+            self.refresh_devices();
+        } else if started.elapsed() >= std::time::Duration::from_secs(25) {
+            self.refresh_devices();
         }
     }
 
@@ -738,152 +801,6 @@ impl NexusCardApp {
         });
     }
 
-    fn select_theme_file(&mut self, ctx: &egui::Context) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("Passcode Theme", &["passthm", "passtheme", "zip"])
-            .pick_file()
-        else {
-            return;
-        };
-
-        self.load_theme_from_path(ctx, &path);
-    }
-
-    fn load_theme_from_path(&mut self, ctx: &egui::Context, path: &Path) {
-        self.add_log(format!("Opening passcode theme package: {}", path.display()));
-        let target_ver = match self.forced_telephony_ver.as_str() {
-            "TelephonyUI-10" => Some("TelephonyUI-10"),
-            "TelephonyUI-9" => Some("TelephonyUI-9"),
-            "TelephonyUI-8" => Some("TelephonyUI-8"),
-            _ => Some("TelephonyUI-10"),
-        };
-
-        match parse_passthm_file(path, target_ver, &self.keypad_language, self.passcode_bold) {
-            Ok(theme) => {
-                self.keypad_textures.clear();
-                for (digit, bytes) in &theme.key_previews {
-                    if let Ok(img) = image::load_from_memory(bytes) {
-                        let rgba = img.to_rgba8();
-                        let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                            [rgba.width() as usize, rgba.height() as usize],
-                            &rgba,
-                        );
-                        let tex = ctx.load_texture(
-                            format!("keypad-{}", digit),
-                            color_image,
-                            egui::TextureOptions::LINEAR,
-                        );
-                        self.keypad_textures.push((digit.clone(), tex));
-                    }
-                }
-                self.keypad_textures.sort_by(|a, b| a.0.cmp(&b.0));
-
-                self.add_log(format!(
-                    "Passcode theme loaded: '{}' (telephony: {}, lang: {}, bold: {}, {} assets)",
-                    theme.name,
-                    theme.detected_version,
-                    self.keypad_language,
-                    self.passcode_bold,
-                    theme.items.len()
-                ));
-                self.status_msg = format!(
-                    "{} '{}' - {} {}, {} {}, {} {}, {} {}",
-                    self.language.text("Loaded"),
-                    theme.name,
-                    theme.items.len(),
-                    self.language.text("assets"),
-                    self.language.text("target:"),
-                    theme.detected_version,
-                    self.language.text("lang:"),
-                    self.keypad_language,
-                    self.language.text("bold:"),
-                    self.language.text(if self.passcode_bold { "ON" } else { "OFF" })
-                );
-                self.theme_path = Some(path.to_path_buf());
-                self.loaded_theme = Some(theme);
-            }
-            Err(err) => {
-                self.add_log(format!("Failed to parse theme: {err:#}"));
-                self.status_msg = format!(
-                    "{} {err:#}",
-                    self.language.text("Failed to parse theme:")
-                );
-            }
-        }
-    }
-
-    fn flash_theme(&mut self) {
-        if !self.validate_selected_transport("Theme flash") {
-            return;
-        }
-        let Some(udid) = self.selected_udid.clone() else {
-            return;
-        };
-        let Some(theme) = self.loaded_theme.as_ref() else {
-            self.add_log("Theme flash failed: No .passthm theme loaded.");
-            self.status_msg = self
-                .language
-                .text("Please select a .passthm theme file first.")
-                .to_string();
-            return;
-        };
-
-        let items = theme.items.clone();
-        self.is_busy = true;
-        self.progress_step = 0;
-        self.progress_total = items.len();
-        self.progress_msg = "Starting passcode theme flash...".to_string();
-        self.status_msg = self
-            .language
-            .text("Writing passcode theme buttons...")
-            .to_string();
-        let connection_mode = self.connection_mode;
-        let language = self.language;
-        self.add_log(format!(
-            "Flashing passcode theme '{}' ({} button assets) to device {} over {}",
-            theme.name,
-            items.len(),
-            udid,
-            connection_mode.label()
-        ));
-
-        let (tx, rx) = channel();
-        self.task_rx = Some(rx);
-
-        thread::spawn(move || {
-            let tx_progress = tx.clone();
-            let tx_log = tx.clone();
-            let res = flash_passcode_theme(
-                &udid,
-                connection_mode,
-                &items,
-                move |step, total, msg| {
-                    let _ = tx_progress.send(BackgroundTaskMessage::Progress {
-                        step,
-                        total,
-                        message: msg.to_string(),
-                    });
-                },
-                move |msg| {
-                    let _ = tx_log.send(BackgroundTaskMessage::Log(msg.to_string()));
-                },
-            );
-
-            match res {
-                Ok(()) => {
-                    let _ = tx.send(BackgroundTaskMessage::Done(Ok(
-                        language
-                            .text("Passcode theme applied! Lock your iPhone to view the new keypad.")
-                            .into(),
-                    )));
-                }
-                Err(e) => {
-                    let _ = tx.send(BackgroundTaskMessage::Done(Err(format!("{:#}", e))));
-                }
-            }
-        });
-    }
-
     fn refresh_license(&mut self) {
         let Some(machine) = self.machine_id.clone() else {
             return;
@@ -1287,6 +1204,21 @@ pub mod md3 {
     pub const SUCCESS: Color32 = Color32::from_rgb(120, 220, 120);
 }
 
+/// Also keeps the log on disk (%LOCALAPPDATA%\NexusCard\nexuscard.log) so a failure can be
+/// diagnosed after the window is closed. Rotates to nexuscard.old.log past 1 MB.
+fn append_log_file(line: &str) {
+    use std::io::Write as _;
+    let dir = crate::paths::local_app_data().join(crate::paths::APP_DIR);
+    let path = dir.join("nexuscard.log");
+    if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 1_000_000) {
+        let _ = std::fs::rename(&path, dir.join("nexuscard.old.log"));
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
 fn draw_status_dot(ui: &mut egui::Ui, color: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
     ui.painter().circle_filled(rect.center(), 4.0, color);
@@ -1385,10 +1317,6 @@ fn setup_custom_theme(ctx: &egui::Context) {
     });
 }
 
-fn m3_card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    ui_kit::glass_panel(ui, add_contents)
-}
-
 fn texture_from_image(ctx: &egui::Context, name: &str, image: &DynamicImage) -> egui::TextureHandle {
     let rgba = image.to_rgba8();
     let color = egui::ColorImage::from_rgba_unmultiplied(
@@ -1405,20 +1333,15 @@ fn language_card_word(language: Language) -> &'static str {
     }
 }
 
+fn load_brand_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let image = image::load_from_memory(include_bytes!("../assets/icon-256.png")).ok()?;
+    Some(texture_from_image(ctx, "brand-logo", &image))
+}
+
 fn is_image_path(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "webp"))
-}
-
-fn m3_button_filled(ui: &mut egui::Ui, label: &str) -> bool {
-    let btn = egui::Button::new(
-        egui::RichText::new(label).size(13.0).color(md3::ON_PRIMARY),
-    )
-    .fill(md3::PRIMARY)
-    .corner_radius(20)
-    .stroke(egui::Stroke::NONE);
-    ui.add(btn).clicked()
 }
 
 fn m3_button_tonal(ui: &mut egui::Ui, label: &str) -> bool {
@@ -1465,6 +1388,7 @@ impl eframe::App for NexusCardApp {
         self.handle_messages();
         self.poll_card_info(ctx);
         self.poll_license(ctx);
+        self.poll_usbmuxd(ctx);
         self.flush_crop_if_idle(ctx);
         self.maybe_fetch_card_info();
         let language = self.language;
@@ -1494,6 +1418,9 @@ impl eframe::App for NexusCardApp {
                 ui.horizontal(|ui| {
                     ui.set_min_height(40.0);
                     ui.spacing_mut().interact_size.y = 34.0;
+                    if let Some(logo) = &self.brand_logo {
+                        ui.add(egui::Image::new(egui::load::SizedTexture::new(logo.id(), egui::vec2(30.0, 30.0))));
+                    }
                     ui.label(
                         egui::RichText::new("NexusCard")
                             .strong()
@@ -1518,7 +1445,6 @@ impl eframe::App for NexusCardApp {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 2.0;
                                 m3_tab(ui, &mut self.current_tab, AppTab::Wallet, language.text("Wallet"));
-                                m3_tab(ui, &mut self.current_tab, AppTab::Passcode, language.text("Passcode"));
                                 m3_tab(ui, &mut self.current_tab, AppTab::Help, language.text("Help"));
                             });
                         });
@@ -1687,7 +1613,6 @@ impl eframe::App for NexusCardApp {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     match self.current_tab {
                         AppTab::Wallet => self.show_wallet_tab(ctx, ui),
-                        AppTab::Passcode => self.show_passcode_tab(ctx, ui),
                         AppTab::Help => self.show_help_tab(ui),
                     }
                 });
@@ -2206,223 +2131,6 @@ impl NexusCardApp {
         });
     }
 
-    fn show_passcode_tab(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
-        let language = self.language;
-        ui.columns(2, |cols| {
-            // Left: config
-            let left = &mut cols[0];
-            m3_card(left, |ui| {
-                ui.label(egui::RichText::new(language.text("Passcode Theme")).strong().size(16.0).color(md3::ON_SURFACE));
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new(language.text("Custom lockscreen keypad from Cowabunga or Nugget")).size(12.0).color(md3::ON_SURFACE_VARIANT));
-                ui.add_space(16.0);
-
-                // Theme file
-                ui.label(egui::RichText::new(language.text("Theme Package")).strong().size(12.0).color(md3::ON_SURFACE));
-                ui.label(egui::RichText::new(language.text("Choose a .passthm archive containing dialer artwork")).size(11.0).color(md3::ON_SURFACE_VARIANT));
-                ui.add_space(4.0);
-                if m3_button_filled(ui, language.text("Choose .passthm...")) { self.select_theme_file(ctx); }
-
-                if let Some(theme) = &self.loaded_theme {
-                    let fname = self.theme_path.as_ref()
-                        .and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("theme.passthm");
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new(format!("{} - {} assets", fname, theme.items.len())).size(11.0).color(md3::PRIMARY));
-                }
-
-                ui.add_space(16.0);
-
-                // iOS version
-                ui.label(egui::RichText::new(language.text("Target iOS Cache")).strong().size(12.0).color(md3::ON_SURFACE));
-                ui.label(egui::RichText::new(language.text("Select cache format based on connected iOS version")).size(11.0).color(md3::ON_SURFACE_VARIANT));
-                ui.add_space(4.0);
-                let combo_w = (ui.available_width() - 4.0).max(150.0);
-                let mut ver_changed = false;
-                egui::ComboBox::from_id_salt("telephony_combo")
-                    .width(combo_w)
-                    .selected_text(language.text(&self.forced_telephony_ver))
-                    .show_ui(ui, |ui| {
-                        ver_changed |= ui.selectable_value(&mut self.forced_telephony_ver, "Auto (TelephonyUI-10)".into(), language.text("Auto (TelephonyUI-10)")).clicked();
-                        ver_changed |= ui.selectable_value(&mut self.forced_telephony_ver, "TelephonyUI-10".into(), language.text("TelephonyUI-10 (iOS 18+)")).clicked();
-                        ver_changed |= ui.selectable_value(&mut self.forced_telephony_ver, "TelephonyUI-9".into(), language.text("TelephonyUI-9 (iOS 16-17)")).clicked();
-                        ver_changed |= ui.selectable_value(&mut self.forced_telephony_ver, "TelephonyUI-8".into(), language.text("TelephonyUI-8 (Legacy)")).clicked();
-                    });
-
-                if ver_changed {
-                    if let Some(path) = self.theme_path.clone() {
-                        self.load_theme_from_path(ctx, &path);
-                    }
-                }
-
-                ui.add_space(16.0);
-
-                // Keypad Language
-                ui.label(egui::RichText::new(language.text("Keypad Language")).strong().size(12.0).color(md3::ON_SURFACE));
-                ui.label(egui::RichText::new(language.text("Subtext alphabet layout (English, Russian, Ukrainian, Japanese, or Universal)")).size(11.0).color(md3::ON_SURFACE_VARIANT));
-                ui.add_space(4.0);
-                let mut lang_changed = false;
-                egui::ComboBox::from_id_salt("keypad_lang_combo")
-                    .width(combo_w)
-                    .selected_text(egui::RichText::new(language.text(&self.keypad_language)).color(md3::ON_SURFACE))
-                    .show_ui(ui, |ui| {
-                        lang_changed |= ui.selectable_value(&mut self.keypad_language, "English".into(), language.text("English")).clicked();
-                        lang_changed |= ui.selectable_value(&mut self.keypad_language, "Russian".into(), language.text("Russian")).clicked();
-                        lang_changed |= ui.selectable_value(&mut self.keypad_language, "Ukrainian".into(), language.text("Ukrainian")).clicked();
-                        lang_changed |= ui.selectable_value(&mut self.keypad_language, "Japanese".into(), language.text("Japanese")).clicked();
-                        lang_changed |= ui.selectable_value(&mut self.keypad_language, "All Languages (Universal)".into(), language.text("All Languages (Universal)")).clicked();
-                    });
-
-                if lang_changed {
-                    if let Some(path) = self.theme_path.clone() {
-                        self.load_theme_from_path(ctx, &path);
-                    }
-                }
-
-                ui.add_space(10.0);
-
-                // Bold Font Toggle
-                let mut bold_changed = false;
-                ui.horizontal(|ui| {
-                    if ui.checkbox(&mut self.passcode_bold, egui::RichText::new(language.text("Bold Text (iOS Accessibility)")).strong().size(12.0).color(md3::ON_SURFACE)).changed() {
-                        bold_changed = true;
-                    }
-                });
-                ui.label(
-                    egui::RichText::new(language.text("Generates *-bold.png for devices with Bold Text turned ON in iPhone Settings -> Display"))
-                        .size(11.0)
-                        .color(md3::ON_SURFACE_VARIANT),
-                );
-
-                if bold_changed {
-                    if let Some(path) = self.theme_path.clone() {
-                        self.load_theme_from_path(ctx, &path);
-                    }
-                }
-
-                ui.add_space(16.0);
-
-                // Apply
-                ui.label(egui::RichText::new(language.text("Write to iPhone")).strong().size(12.0).color(md3::ON_SURFACE));
-                ui.add_space(4.0);
-
-                let can_flash = !self.is_busy
-                    && self.selected_transport_available()
-                    && self.loaded_theme.is_some();
-                let flash_btn = egui::Button::new(
-                    egui::RichText::new(language.text("Apply Passcode Theme")).strong().size(14.0)
-                        .color(if can_flash { md3::ON_PRIMARY } else { md3::ON_SURFACE_VARIANT }),
-                )
-                .fill(if can_flash { md3::PRIMARY } else { md3::SURFACE_CONTAINER_HIGH })
-                .corner_radius(20).stroke(egui::Stroke::NONE)
-                .min_size(egui::vec2(ui.available_width(), 40.0));
-
-                let resp = ui.add_enabled(can_flash, flash_btn);
-                if resp.clicked() { self.flash_theme(); }
-                if !can_flash {
-                    let mut r = Vec::new();
-                    if self.selected_udid.is_none() { r.push(language.text("connect iPhone")); }
-                    else if !self.selected_transport_available() { r.push(language.text("choose available transport")); }
-                    if self.loaded_theme.is_none() { r.push(language.text("select theme")); }
-                    if !r.is_empty() { resp.on_disabled_hover_text(format!("{}{}", language.text("Need: "), r.join(", "))); }
-                }
-
-                if self.is_busy {
-                    ui.add_space(8.0);
-                    if self.progress_total > 0 {
-                        ui.add(egui::ProgressBar::new(self.progress_step as f32 / self.progress_total as f32).animate(true));
-                    }
-                    ui.label(egui::RichText::new(&self.progress_msg).size(11.0).color(md3::PRIMARY));
-                }
-            });
-
-            // Right: preview
-            let right = &mut cols[1];
-            m3_card(right, |ui| {
-                ui.label(egui::RichText::new(language.text("Keypad Preview")).strong().size(16.0).color(md3::ON_SURFACE));
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new(language.text("Dialer button artwork")).size(12.0).color(md3::ON_SURFACE_VARIANT));
-                ui.add_space(12.0);
-
-                let pass_w = (ui.available_width() - 8.0).clamp(240.0, 360.0);
-                let pass_h = 265.0;
-
-                ui.vertical_centered(|ui| {
-                    if self.keypad_textures.is_empty() {
-                        let (rect, _) = ui.allocate_exact_size(egui::vec2(pass_w, pass_h), egui::Sense::hover());
-                        let painter = ui.painter();
-                        painter.rect_filled(rect, 16.0, md3::SURFACE_CONTAINER_HIGH);
-                        painter.text(rect.center(), egui::Align2::CENTER_CENTER,
-                            language.text("No theme loaded"), egui::FontId::proportional(14.0), md3::ON_SURFACE_VARIANT);
-                    } else {
-                        let (rect, _) = ui.allocate_exact_size(egui::vec2(pass_w, pass_h), egui::Sense::hover());
-                        let painter = ui.painter();
-                        painter.rect_filled(rect, 16.0, md3::SURFACE_CONTAINER_HIGH);
-                        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-                            ui.vertical_centered(|ui| {
-                                ui.add_space(10.0);
-                                const DIALER_LAYOUT: &[&[&str]] = &[
-                                    &["1", "2", "3"],
-                                    &["4", "5", "6"],
-                                    &["7", "8", "9"],
-                                    &["", "0", ""],
-                                ];
-                                egui::Grid::new("keypad_grid")
-                                    .spacing([18.0, 6.0])
-                                    .show(ui, |ui| {
-                                        for row in DIALER_LAYOUT {
-                                            for &d in *row {
-                                                if d.is_empty() {
-                                                    ui.allocate_exact_size(egui::vec2(44.0, 50.0), egui::Sense::hover());
-                                                } else if let Some((_, tex)) = self.keypad_textures.iter().find(|(k, _)| k == d) {
-                                                    ui.vertical_centered(|ui| {
-                                                        egui::Frame::new()
-                                                            .fill(md3::SURFACE)
-                                                            .corner_radius(12)
-                                                            .inner_margin(3)
-                                                            .show(ui, |ui| { ui.image((tex.id(), egui::vec2(40.0, 40.0))); });
-                                                        ui.label(egui::RichText::new(d).size(9.5).color(md3::ON_SURFACE_VARIANT));
-                                                    });
-                                                } else {
-                                                    ui.vertical_centered(|ui| {
-                                                        egui::Frame::new()
-                                                            .fill(md3::SURFACE)
-                                                            .corner_radius(12)
-                                                            .inner_margin(3)
-                                                            .show(ui, |ui| {
-                                                                let (btn_rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
-                                                                ui.painter().rect_filled(btn_rect, 8.0, md3::SURFACE_CONTAINER);
-                                                                ui.painter().text(btn_rect.center(), egui::Align2::CENTER_CENTER, d, egui::FontId::proportional(14.0), md3::ON_SURFACE_VARIANT);
-                                                            });
-                                                        ui.label(egui::RichText::new(d).size(9.5).color(md3::ON_SURFACE_VARIANT));
-                                                    });
-                                                }
-                                            }
-                                            ui.end_row();
-                                        }
-                                    });
-                            });
-                        });
-                    }
-                });
-
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(language.text("3x4 Keypad")).size(11.0).color(md3::ON_SURFACE_VARIANT));
-                    ui.label(egui::RichText::new("|").size(11.0).color(md3::OUTLINE_VARIANT));
-                    ui.label(egui::RichText::new("TelephonyUI").size(11.0).color(md3::ON_SURFACE_VARIANT));
-                    ui.label(egui::RichText::new("|").size(11.0).color(md3::OUTLINE_VARIANT));
-                    if self.loaded_theme.is_some() {
-                        ui.label(egui::RichText::new(language.text("Ready")).size(11.0).color(md3::SUCCESS));
-                    } else {
-                        ui.label(egui::RichText::new(language.text("No theme")).size(11.0).color(md3::ON_SURFACE_VARIANT));
-                    }
-                });
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new(language.text("After applying, lock your iPhone to see the new keypad.")).size(11.0).color(md3::ON_SURFACE_VARIANT));
-            });
-        });
-    }
-
     fn show_help_tab(&mut self, ui: &mut egui::Ui) {
         let language = self.language;
 
@@ -2495,10 +2203,10 @@ impl NexusCardApp {
             });
             ui_kit::glass_panel(&mut cols[1], |ui| {
                 ui.set_min_height(row_h);
-                heading(ui, language.text("Passcode themes (.passthm)"), language.text("Compatible with Cowabunga and Nugget"));
-                bullet(ui, language.text("iOS 18+: choose \"Auto (TelephonyUI-10)\"."));
-                bullet(ui, language.text("iOS 16-17: choose \"TelephonyUI-9\"."));
-                bullet(ui, language.text("Lock the screen to see the new keypad."));
+                heading(ui, language.text("Using WiFi"), language.text("Apply designs without the cable"));
+                bullet(ui, language.text("With the cable connected, enable \"Show this iPhone when on Wi-Fi\" in Apple Devices."));
+                bullet(ui, language.text("Turn off \"Private Wi-Fi Address\" for your network on the iPhone."));
+                bullet(ui, language.text("Keep Apple Devices open and the iPhone unlocked on the same network."));
             });
         });
     }

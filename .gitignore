@@ -23,9 +23,5 @@ Desktop.ini
 *.log
 *.tmp
 
-target-ui/
-target-ui2/
-target-ui3/
-target-ui4/
-target-ui5/
-target-ui6/
+# Local build folders (cargo --target-dir)
+target-*/

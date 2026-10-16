@@ -138,14 +138,84 @@ pub struct AppleLibraries {
 
 static LIBRARIES: OnceLock<Arc<AppleLibraries>> = OnceLock::new();
 
+/// The Microsoft Store "Apple Devices" app ships the same three DLLs in its package folder.
+/// WindowsApps cannot be listed without elevation, so the package roots come from the registry.
+fn store_package_dirs() -> Vec<PathBuf> {
+    use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
+
+    let packages = RegKey::predef(HKEY_CURRENT_USER).open_subkey(
+        r"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages",
+    );
+    let Ok(packages) = packages else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = packages
+        .enum_keys()
+        .flatten()
+        .filter(|name| name.starts_with("AppleInc.AppleDevices_"))
+        .collect();
+    names.sort();
+    names.reverse(); // newest package version first
+    names
+        .iter()
+        .filter_map(|name| {
+            let root: String = packages.open_subkey(name).ok()?.get_value("PackageRootFolder").ok()?;
+            Some(PathBuf::from(root))
+        })
+        .collect()
+}
+
+fn has_support_dlls(dir: &std::path::Path) -> bool {
+    dir.join("CoreFoundation.dll").is_file()
+        && dir.join("MobileDevice.dll").is_file()
+        && dir.join("AirTrafficHost.dll").is_file()
+}
+
+/// DLLs the Apple runtime needs, so a copy of the Store package can stay small (about 125 MB).
+const STORE_RUNTIME_DLLS: &[&str] = &[
+    "CoreFoundation.dll", "MobileDevice.dll", "AirTrafficHost.dll", "ASL.dll", "CFNetwork.dll",
+    "Foundation.dll", "icuuc.dll", "libdispatch.dll", "libicuin.dll", "libicuuc.dll", "objc.dll",
+    "pthreadVC2.dll", "zlib1.dll", "CoreFP.dll", "dnssd.dll", "libxml2.dll", "SQLite3.dll",
+    "icudt62.dll", "CoreKE.dll",
+];
+
+/// Windows refuses to load DLLs straight out of the protected Store package folder (access denied),
+/// so the runtime is copied once per package version into the user's local data folder.
+fn stage_store_runtime(package_dir: &std::path::Path) -> Option<PathBuf> {
+    let package_name = package_dir.file_name()?;
+    let target = PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
+        .join("NexusCard")
+        .join("apple-runtime")
+        .join(package_name);
+    if has_support_dlls(&target) {
+        return Some(target);
+    }
+    std::fs::create_dir_all(&target).ok()?;
+    for name in STORE_RUNTIME_DLLS {
+        let source = package_dir.join(name);
+        if source.is_file() {
+            std::fs::copy(&source, target.join(name)).ok()?;
+        }
+    }
+    has_support_dlls(&target).then_some(target)
+}
+
+/// True when the Microsoft Store "Apple Devices" app is installed for this user.
+pub fn apple_devices_installed() -> bool {
+    !store_package_dirs().is_empty()
+}
+
 pub fn locate_support_dir() -> Option<PathBuf> {
     APPLE_SUPPORT_DIRS
         .iter()
         .map(PathBuf::from)
-        .find(|dir| {
-            dir.join("CoreFoundation.dll").is_file()
-                && dir.join("MobileDevice.dll").is_file()
-                && dir.join("AirTrafficHost.dll").is_file()
+        .find(|dir| has_support_dlls(dir))
+        .or_else(|| {
+            store_package_dirs()
+                .into_iter()
+                .filter(|dir| has_support_dlls(dir))
+                .find_map(|dir| stage_store_runtime(&dir))
         })
 }
 

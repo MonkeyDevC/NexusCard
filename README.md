@@ -46,9 +46,55 @@ El proyecto es de código abierto (MIT). La comprobación de licencia está en [
 
 La app se comunica con `scalvache.shop` solo para comprobar y registrar la licencia. Envía: un **hash anónimo del equipo** (SHA-256 del identificador de Windows, no reversible), la versión de la app y, según tu IP, el país aproximado. Si compras, la pasarela de pago (Bold o Wompi) procesa tu pago y nos informa del correo y el monto; nunca vemos datos de tu tarjeta. No se leen tus tarjetas de Wallet, ni tus fotos, ni se envían imágenes.
 
+## Arquitectura y tecnologías
+
+NexusCard tiene dos piezas: la **app de escritorio** (este repositorio) y un **servidor de licencias y pagos** (repositorio privado).
+
+```
+ App de Windows (Rust + egui)  ──USB / WiFi──►  iPhone (usbmuxd · AFC · AirTraffic)
+          │
+          └──HTTPS──►  scalvache.shop  (Node.js + Fastify + SQLite)  ──►  Bold / Wompi
+```
+
+### App de escritorio
+
+| Capa | Tecnología |
+| :-- | :-- |
+| Lenguaje | **Rust** (edición 2024) |
+| Interfaz | **egui / eframe 0.33**, selector de archivos con `rfd` |
+| Conexión con el iPhone | Bibliotecas de Apple (`CoreFoundation`, `MobileDevice`, `AirTrafficHost`) cargadas en tiempo de ejecución con `libloading`, desde **Dispositivos Apple** (Microsoft Store) o iTunes |
+| Transporte | **usbmuxd** (`127.0.0.1:27015`) por **USB o WiFi**, servicios **AFC** (archivos), **syslog_relay** (detección de tarjetas) y **AirTraffic** (sincronización) |
+| Imagen de la tarjeta | `image` (PNG, JPEG, WebP), encuadre con zoom y conversión propia a PDF |
+| Formatos de iOS | `plist`, `zip`, `miniz_oxide` |
+| Licencia | Cliente HTTP `ureq`, tokens firmados con **Ed25519** (`ed25519-dalek`) y hash anónimo del equipo con **SHA-256** |
+| Windows | `winreg`, `winresource` (icono y versión en el `.exe`), instalador con **Inno Setup** |
+| CI/CD | **GitHub Actions**: tests, compilación, instalador, `SHA256SUMS.txt` y publicación en Releases |
+
+Módulos principales (`src/`):
+
+| Módulo | Qué hace |
+| :-- | :-- |
+| `apple.rs` | Localiza y carga las bibliotecas de Apple (iTunes o Dispositivos Apple) |
+| `device.rs` | Lista iPhones por usbmuxd (USB y WiFi), abre sesiones y arranca Dispositivos Apple si su servicio no responde |
+| `scanner.rs` | Escucha el registro del iPhone para capturar el identificador de cada tarjeta de Wallet |
+| `card_info.rs` | Lee el diseño actual de una tarjeta, sus últimos dígitos y la red |
+| `image_skin.rs` | Encuadra la imagen al tamaño de la tarjeta (1536 × 969) y genera PNG y PDF |
+| `afc.rs`, `airlift.rs`, `airtraffic.rs`, `flasher.rs` | Escriben el diseño en el iPhone mediante el método de sincronización |
+| `wallet_backup.rs` | Guarda el diseño original para poder restaurarlo |
+| `license.rs` | Prueba gratis y licencia completa contra el servidor |
+| `app.rs`, `ui_kit.rs`, `i18n*.rs` | Interfaz, componentes visuales e idiomas (español e inglés) |
+
+### Servidor de licencias y pagos
+
+**Node.js 22 + Fastify 5**, base de datos **SQLite** (`better-sqlite3`), pagos con **Bold** y **Wompi** (webhooks verificados), licencias firmadas con **Ed25519**, precio por país con `geoip-lite`, panel de administración con **Chart.js** y landing en `scalvache.shop`. Corre en **Docker Compose** detrás de **Caddy** en un VPS.
+
+### Diagnóstico
+
+La app guarda su registro en `%LOCALAPPDATA%\NexusCard\nexuscard.log`. Si algo falla, ese archivo dice en qué paso.
+
 ## Compilar desde el código
 
-Requisitos: Rust (estable), Visual Studio Build Tools (C++), Apple Devices o iTunes de 64 bits.
+Requisitos: Rust (estable), Visual Studio Build Tools (C++) y Dispositivos Apple (Microsoft Store) o iTunes de 64 bits.
 
 ```sh
 cargo test

@@ -114,6 +114,24 @@ pub struct UsbmuxDeviceEntry {
     pub properties_plist: Vec<u8>,
 }
 
+const USBMUXD_ADDR: &str = "127.0.0.1:27015";
+
+/// True when Apple's usbmuxd (from Apple Devices or iTunes) answers on 127.0.0.1:27015.
+pub fn usbmuxd_available() -> bool {
+    let addr: SocketAddr = USBMUXD_ADDR.parse().unwrap();
+    TcpStream::connect_timeout(&addr, Duration::from_millis(400)).is_ok()
+}
+
+/// Opens the Microsoft Store "Apple Devices" app. Its AppleMobileDeviceProcess is what
+/// serves usbmuxd, and it does not run on its own when the user disabled the app's
+/// startup task in Windows (Settings > Apps > Startup), which is common.
+pub fn launch_apple_devices() -> bool {
+    std::process::Command::new("explorer.exe")
+        .arg(r"shell:AppsFolder\AppleInc.AppleDevices_nzyj5cx40ttqa!App")
+        .spawn()
+        .is_ok()
+}
+
 pub fn query_usbmux_devices() -> Result<Vec<UsbmuxDeviceEntry>> {
     let addr: SocketAddr = "127.0.0.1:27015".parse().unwrap();
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))

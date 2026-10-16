@@ -25,6 +25,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
 WizardStyle=modern
 UninstallDisplayIcon={app}\nexuscard.exe
+SetupIconFile=..\assets\icon.ico
 
 [Languages]
 Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
